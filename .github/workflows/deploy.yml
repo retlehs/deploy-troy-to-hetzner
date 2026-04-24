@@ -1,0 +1,151 @@
+name: Deploy Troy
+
+on:
+  workflow_dispatch:
+    inputs:
+      fqdn:
+        description: 'Full domain (e.g., troy.example.com) — you will create the A record after deploy'
+        required: true
+      admin_email:
+        description: "Admin email (WP admin + Let's Encrypt notifications)"
+        required: true
+      site_title:
+        description: 'WP site title'
+        required: false
+        default: 'Troy Server'
+      server_type:
+        description: 'Hetzner server type. cx23 (EU-only, cheapest). For US/Singapore use cpx22.'
+        required: false
+        default: 'cx23'
+      location:
+        description: 'Hetzner location (fsn1, nbg1, hel1, ash, hil, sin)'
+        required: false
+        default: 'fsn1'
+      plugin_repo:
+        description: 'GitHub owner/repo for Troy Server plugin'
+        required: false
+        default: 'sybrew/troy'
+      ssh_key_names:
+        description: 'Comma-separated SSH key names pre-uploaded to Hetzner (optional)'
+        required: false
+        default: ''
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Generate credentials
+        id: creds
+        run: |
+          gen() { head -c 48 /dev/urandom | LC_ALL=C tr -dc 'A-Za-z0-9' | head -c 24; }
+          {
+            echo "admin_password=$(gen)"
+            echo "db_root_password=$(gen)"
+            echo "db_password=$(gen)"
+            echo "server_name=troy-$(echo '${{ inputs.fqdn }}' | tr '.' '-')"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Render cloud-init
+        env:
+          DOMAIN: ${{ inputs.fqdn }}
+          ADMIN_EMAIL: ${{ inputs.admin_email }}
+          ADMIN_USER: admin
+          ADMIN_PASSWORD: ${{ steps.creds.outputs.admin_password }}
+          SITE_TITLE: ${{ inputs.site_title }}
+          PLUGIN_REPO: ${{ inputs.plugin_repo }}
+          DB_ROOT_PASSWORD: ${{ steps.creds.outputs.db_root_password }}
+          DB_PASSWORD: ${{ steps.creds.outputs.db_password }}
+        run: |
+          python3 - <<'PY'
+          import os
+          tpl = open('cloud-init.yaml.tmpl').read()
+          for k in ['DOMAIN','ADMIN_EMAIL','ADMIN_USER','ADMIN_PASSWORD',
+                    'SITE_TITLE','PLUGIN_REPO','DB_ROOT_PASSWORD','DB_PASSWORD']:
+              tpl = tpl.replace('{{' + k + '}}', os.environ[k])
+          open('rendered-cloud-init.yaml','w').write(tpl)
+          PY
+          size=$(wc -c < rendered-cloud-init.yaml)
+          echo "user_data size: $size bytes (limit 32768)"
+          [ "$size" -lt 32768 ]
+
+      - name: Create Hetzner server
+        id: hetzner
+        env:
+          HETZNER_TOKEN: ${{ secrets.HETZNER_TOKEN }}
+          SERVER_NAME: ${{ steps.creds.outputs.server_name }}
+          SERVER_TYPE: ${{ inputs.server_type }}
+          LOCATION: ${{ inputs.location }}
+          SSH_KEY_NAMES: ${{ inputs.ssh_key_names }}
+        run: |
+          SSH_KEY_IDS_JSON='[]'
+          if [ -n "$SSH_KEY_NAMES" ]; then
+            ALL_KEYS=$(curl -sSL -H "Authorization: Bearer $HETZNER_TOKEN" \
+              'https://api.hetzner.cloud/v1/ssh_keys?per_page=50')
+            SSH_KEY_IDS_JSON=$(jq -cn \
+              --arg names "$SSH_KEY_NAMES" \
+              --argjson keys "$ALL_KEYS" \
+              '($names | split(",") | map(gsub("^\\s+|\\s+$"; ""))) as $want
+               | [ $want[] as $n
+                   | ($keys.ssh_keys[] | select(.name == $n) | .id) ] as $found
+               | if ($found | length) != ($want | length)
+                 then error("SSH key name(s) not found. Wanted: \($want). Available: \($keys.ssh_keys | map(.name))")
+                 else $found end')
+            echo "Resolved SSH key IDs: $SSH_KEY_IDS_JSON"
+          fi
+
+          PAYLOAD=$(jq -n \
+            --arg name "$SERVER_NAME" \
+            --arg type "$SERVER_TYPE" \
+            --arg loc  "$LOCATION" \
+            --arg ud   "$(cat rendered-cloud-init.yaml)" \
+            --argjson keys "$SSH_KEY_IDS_JSON" \
+            '{name:$name, server_type:$type, location:$loc, image:"ubuntu-24.04", user_data:$ud, ssh_keys:$keys}')
+
+          RESPONSE=$(curl -sSL -X POST \
+            -H "Authorization: Bearer $HETZNER_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD" \
+            'https://api.hetzner.cloud/v1/servers')
+
+          IP=$(echo "$RESPONSE" | jq -r '.server.public_net.ipv4.ip // empty')
+          ID=$(echo "$RESPONSE" | jq -r '.server.id // empty')
+          if [ -z "$IP" ]; then
+            echo "Server creation failed. Hetzner API response:" >&2
+            echo "$RESPONSE" | jq . >&2
+            exit 1
+          fi
+          echo "ip=$IP"  >> "$GITHUB_OUTPUT"
+          echo "id=$ID"  >> "$GITHUB_OUTPUT"
+
+      - name: Summary
+        run: |
+          {
+            echo "## Troy deploy started"
+            echo ""
+            echo "### 1. Create this DNS record at your provider"
+            echo ""
+            echo "| Type | Name | Value | TTL |"
+            echo "| --- | --- | --- | --- |"
+            echo "| A | \`${{ inputs.fqdn }}\` | \`${{ steps.hetzner.outputs.ip }}\` | 60 |"
+            echo ""
+            echo "### 2. Once DNS resolves, Caddy auto-provisions the Let's Encrypt cert"
+            echo ""
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| Site | https://${{ inputs.fqdn }} |"
+            echo "| Admin URL | https://${{ inputs.fqdn }}/wp-admin |"
+            echo "| Admin user | \`admin\` |"
+            echo "| Admin password | \`${{ steps.creds.outputs.admin_password }}\` |"
+            echo "| Server IP | \`${{ steps.hetzner.outputs.ip }}\` |"
+            echo "| Server ID | \`${{ steps.hetzner.outputs.id }}\` |"
+            echo ""
+            echo "Provisioning takes ~3–5 min. If you attached an SSH key:"
+            echo ""
+            echo '```'
+            echo "ssh root@${{ steps.hetzner.outputs.ip }} tail -f /var/log/troy-install.log"
+            echo '```'
+            echo ""
+            echo "**Save the admin password now — it is not stored anywhere else.**"
+          } >> "$GITHUB_STEP_SUMMARY"
