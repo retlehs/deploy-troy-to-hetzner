@@ -1,7 +1,7 @@
 # Deploy Troy to Hetzner Cloud
 
 > [!TIP]
-> Sign up for [Hetzner Cloud](https://hetzner.cloud/?ref=V6DnI7GDHM4N) through the Roots referral link to receive $20 in cloud credits.
+> Sign up for [Hetzner Cloud via this referral link](https://hetzner.cloud/?ref=V6DnI7GDHM4N) — new accounts may receive cloud credits, and Roots receives referral credit in return.
 
 > [!WARNING]
 > The deploy workflow prints the generated WordPress admin password in the run summary and logs. If your fork is public, anyone can read that password from your Actions tab until you change it. Either keep the fork private, or change the password via `wp-admin` immediately after first login.
@@ -39,7 +39,7 @@ Fork, add one secret, click **Run workflow**, paste the returned IP into your DN
 
 1. **Actions → Deploy Troy → Run workflow**
 2. Fill in:
-   - **fqdn** — e.g. `troy.example.com`
+   - **fqdn** — e.g. `troy.example.org`
    - **admin_email** — used for WP admin + Let's Encrypt renewal notices
    - Optional: `site_title`, `server_type`, `location`, `plugin_repo`, `ssh_key_names`
 3. **Run workflow**
